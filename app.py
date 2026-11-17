@@ -40,8 +40,9 @@ def detetar_separador(txt: str) -> str:
         return max(cont, key=cont.get)
 
 
-def ler_bruto(nome: str, raw: bytes, todas_folhas: bool):
-    """Devolve lista de (folha, DataFrame sem cabeçalho, info)."""
+def ler_bruto(nome: str, raw: bytes, modo_folhas: str = "auto"):
+    """Devolve lista de (folha, DataFrame sem cabeçalho, info) com TODAS as folhas não vazias.
+    A escolha de folhas (auto/primeira/todas) é feita em processar()."""
     ext = nome.lower().rsplit(".", 1)[-1]
     if ext in ("csv", "txt"):
         txt = decodificar(raw)
@@ -49,35 +50,217 @@ def ler_bruto(nome: str, raw: bytes, todas_folhas: bool):
         df = pd.read_csv(io.StringIO(txt), sep=sep, header=None, dtype=str,
                          keep_default_na=False, engine="python", on_bad_lines="skip")
         return [("", df.replace("", None), f"sep='{sep}'")]
-    engine = "xlrd" if ext == "xls" else None
-    folhas = pd.read_excel(io.BytesIO(raw), sheet_name=None if todas_folhas else 0,
-                           header=None, dtype=object, engine=engine)
-    if isinstance(folhas, pd.DataFrame):
-        folhas = {"": folhas}
     if ext in ("xlsx", "xlsm"):
-        preencher_unidas(raw, folhas)
+        return ler_xlsx(raw)
+    folhas = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=None, dtype=object,
+                           engine="xlrd")
     return [(f, d, "") for f, d in folhas.items() if not d.dropna(how="all").empty]
 
 
-def preencher_unidas(raw: bytes, folhas: dict):
-    """Repete o valor das células unidas (merge) nas primeiras linhas, para cabeçalhos de vários níveis."""
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=False, data_only=True)
-    except Exception:
-        return
-    nomes = list(folhas)
-    for idx, nome in enumerate(nomes):
-        ws = wb[nome] if nome in wb.sheetnames else wb.worksheets[idx]
-        df = folhas[nome]
-        for r in ws.merged_cells.ranges:
-            if r.min_row > 60:
+# ---------------------------------------------------------------- fórmulas sem valor
+_RE_RANGE = re.compile(r"(?:(?:'((?:[^']|'')+)'|([^\W\d][\w.]*))!)?\$?([A-Z]{1,3})(?:\$?(\d+))?"
+                       r":\$?([A-Z]{1,3})(?:\$?(\d+))?")
+_RE_CELL = re.compile(r"(?:(?:'((?:[^']|'')+)'|([^\W\d][\w.]*))!)?\$?([A-Z]{1,3})\$?(\d+)(?![\w(])")
+_FUNCS = {"SUM": "_sum", "MIN": "_min", "MAX": "_max", "AVERAGE": "_avg", "ABS": "_abs",
+          "ROUND": "_round"}
+_PERMITIDOS = {"_c", "_r", *_FUNCS.values()}
+
+
+def _col_idx(letras: str) -> int:
+    n = 0
+    for ch in letras:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+class AvaliadorFormulas:
+    """Calcula fórmulas simples (+ - * / ^, SUM/MIN/MAX/AVERAGE/ABS/ROUND, referências a
+    células e intervalos, incluindo noutras folhas) quando o ficheiro não traz o valor
+    calculado. Fórmulas não suportadas ficam vazias."""
+
+    def __init__(self, formulas: dict, valores: dict, dims: dict):
+        self.f, self.v, self.dims = formulas, valores, dims  # {folha: {(r,c): x}}
+        self.nomes = list(formulas)
+        self.cache, self.em_curso = {}, set()
+        self.falhas = 0
+
+    def valor(self, folha, r, c):
+        k = (folha, r, c)
+        if k in self.cache:
+            return self.cache[k]
+        x = self.f[folha].get((r, c))
+        if isinstance(x, str) and x.startswith("="):
+            cached = self.v[folha].get((r, c))
+            if cached is not None:
+                res = cached
+            elif k in self.em_curso:
+                res = None
+            else:
+                self.em_curso.add(k)
+                res = self._avaliar(x[1:], folha)
+                self.em_curso.discard(k)
+                if res is None:
+                    self.falhas += 1
+        else:
+            res = x
+        self.cache[k] = res
+        return res
+
+    def _folha(self, q, n, atual):
+        nome = (q.replace("''", "'") if q else n) or atual
+        return self.nomes.index(nome) if nome in self.nomes else -1
+
+    def _avaliar(self, expr, folha_atual):
+        try:
+            atual = self.nomes.index(folha_atual)
+
+            def rep_range(m):
+                si = self._folha(m.group(1), m.group(2), folha_atual)
+                if si < 0:
+                    raise ValueError
+                r1 = int(m.group(4)) if m.group(4) else 1
+                r2 = int(m.group(6)) if m.group(6) else self.dims[self.nomes[si]][0]
+                return f"_r({si},{_col_idx(m.group(3))},{r1},{_col_idx(m.group(5))},{r2})"
+
+            def rep_cell(m):
+                si = self._folha(m.group(1), m.group(2), folha_atual)
+                if si < 0:
+                    raise ValueError
+                return f"_c({si},{int(m.group(4))},{_col_idx(m.group(3))})"
+
+            e = _RE_RANGE.sub(rep_range, expr)
+            e = _RE_CELL.sub(rep_cell, e)
+            for fx, py in _FUNCS.items():
+                e = re.sub(rf"\b{fx}\s*\(", py + "(", e, flags=re.I)
+            e = e.replace("^", "**").replace(";", ",")
+            if not re.fullmatch(r"[\d\s.+\-*/(),_a-z]*", e):
+                return None
+            if set(re.findall(r"[_a-z]+", e)) - _PERMITIDOS:
+                return None
+            return eval(e, {"__builtins__": {}}, self._ambiente(atual))  # noqa: S307
+        except Exception:
+            return None
+
+    def _ambiente(self, atual):
+        def num(x):
+            if x is None or x == "":
+                return 0
+            if isinstance(x, bool):
+                return int(x)
+            if isinstance(x, (int, float)):
+                return x
+            raise ValueError
+
+        def c(si, r, col):
+            return num(self.valor(self.nomes[si], r, col))
+
+        def r(si, c1, r1, c2, r2):
+            nome = self.nomes[si]
+            out = []
+            for rr in range(r1, r2 + 1):
+                for cc in range(c1, c2 + 1):
+                    x = self.valor(nome, rr, cc)
+                    if isinstance(x, (int, float)) and not isinstance(x, bool):
+                        out.append(x)
+            return out
+
+        def achatar(args):
+            out = []
+            for a in args:
+                out.extend(a if isinstance(a, list) else [a])
+            return out
+
+        return {"_c": c, "_r": r,
+                "_sum": lambda *a: sum(achatar(a)),
+                "_min": lambda *a: min(achatar(a)) if achatar(a) else 0,
+                "_max": lambda *a: max(achatar(a)) if achatar(a) else 0,
+                "_avg": lambda *a: sum(achatar(a)) / len(achatar(a)),
+                "_abs": abs, "_round": lambda x, n=0: round(x, int(n))}
+
+
+def ler_xlsx(raw: bytes):
+    import openpyxl
+    wb_f = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
+    wb_v = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    formulas, valores, dims = {}, {}, {}
+    for ws in wb_f.worksheets:
+        f = {}
+        for row in ws.iter_rows():
+            for c in row:
+                if c.value is not None:
+                    f[(c.row, c.column)] = c.value
+        formulas[ws.title] = f
+        dims[ws.title] = (ws.max_row, ws.max_column)
+    for ws in wb_v.worksheets:
+        v = {}
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            for j, x in enumerate(row, start=1):
+                if x is not None:
+                    v[(i, j)] = x
+        valores[ws.title] = v
+    ava = AvaliadorFormulas(formulas, valores, dims)
+
+    saida = []
+    for ws in wb_f.worksheets:
+        nr, nc = dims[ws.title]
+        if not formulas[ws.title]:
+            continue
+        grelha = [[ava.valor(ws.title, r, c) for c in range(1, nc + 1)] for r in range(1, nr + 1)]
+        df = pd.DataFrame(grelha, dtype=object)
+        for rng in ws.merged_cells.ranges:  # células unidas: repetir valor (cabeçalhos)
+            if rng.min_row > 60:
                 continue
-            v = df.iat[r.min_row - 1, r.min_col - 1] if r.min_row - 1 < len(df) \
-                and r.min_col - 1 < df.shape[1] else None
-            for i in range(r.min_row - 1, min(r.max_row, len(df))):
-                for j in range(r.min_col - 1, min(r.max_col, df.shape[1])):
-                    df.iat[i, j] = v
+            v0 = df.iat[rng.min_row - 1, rng.min_col - 1]
+            for i in range(rng.min_row - 1, min(rng.max_row, len(df))):
+                for j in range(rng.min_col - 1, min(rng.max_col, df.shape[1])):
+                    df.iat[i, j] = v0
+        if df.dropna(how="all").empty:
+            continue
+        n_form = sum(1 for x in formulas[ws.title].values() if isinstance(x, str) and x.startswith("="))
+        info = f"{n_form} fórmulas" if n_form else ""
+        saida.append((ws.title, df, info))
+    if ava.falhas:
+        saida = [(f, d, (i + f"; {ava.falhas} fórmulas não calculadas").strip("; "))
+                 for f, d, i in saida]
+    return saida
+
+
+# ---------------------------------------------------------------- folhas tipo formulário
+def e_formulario(df: pd.DataFrame) -> bool:
+    """Folha tipo 'Resumo': pares etiqueta/valor em vez de tabela."""
+    if len(df) > 400 or df.notna().sum(axis=1).max() > 3:
+        return False
+    linhas = [df.iloc[i].dropna() for i in range(len(df))]
+    linhas = [l for l in linhas if len(l)]
+    if not linhas or len(linhas) > 300:
+        return False
+    if max(len(l) for l in linhas) > 3:
+        return False
+    pares = sum(1 for l in linhas if len(l) == 2 and e_texto(l.iloc[0]))
+    return pares >= 3 and pares >= 0.5 * len(linhas)
+
+
+def extrair_pares(df: pd.DataFrame) -> dict:
+    out = {}
+    for i in range(len(df)):
+        l = df.iloc[i].dropna()
+        if len(l) == 2 and e_texto(l.iloc[0]):
+            k = re.sub(r"\s+", " ", str(l.iloc[0])).strip().rstrip(":").strip()
+            base, n = k, 1
+            while k in out:
+                n += 1
+                k = f"{base}_{n}"
+            out[k] = l.iloc[1]
+    return out
+
+
+def e_identificador(v) -> bool:
+    """Valores a repetir como coluna em cada linha (CPE, cliente, NIF, datas do período)."""
+    if isinstance(v, str):
+        return 0 < len(v.strip()) <= 80
+    if isinstance(v, (datetime, pd.Timestamp)):
+        return True
+    return isinstance(v, int) and not isinstance(v, bool) and abs(v) >= 100000
 
 
 def e_texto(v) -> bool:
@@ -298,31 +481,65 @@ def gerar_excel(folhas: dict) -> bytes:
 
 
 # =========================================================================== pipeline
-def processar(ficheiros, todas_folhas=False, remover_dup=True, juntar_maiusc=True,
-              incluir_origem=True, hdr_manual=None, prog=None):
+def processar(ficheiros, modo_folhas="auto", remover_dup=False, juntar_maiusc=True,
+              incluir_origem=True, hdr_manual=None, prog=None, remover_fich_rep=True,
+              meta_colunas=True):
     """ficheiros: lista de (nome, bytes). Devolve (df, folhas, log, n_bruto, tem_data)."""
-    partes, log = [], []
+    import hashlib
+    partes, log, resumos = [], [], []
+    vistos = {}
     for i, f in enumerate(sorted(ficheiros, key=lambda x: x[0])):
         try:
-            for folha, bruto, info in ler_bruto(f[0], f[1], todas_folhas):
+            h = hashlib.md5(f[1]).hexdigest()
+            if remover_fich_rep and h in vistos:
+                log.append({"Ficheiro": f[0], "Folha": "", "Linhas": 0, "Linha cabeçalho": None,
+                            "Coluna de data": "", "Data mín": None, "Data máx": None,
+                            "Info": f"ignorado: igual a {vistos[h]}", "Erro": ""})
+                if prog: prog((i + 1) / len(ficheiros))
+                continue
+            vistos[h] = f[0]
+            todas = ler_bruto(f[0], f[1])
+            if modo_folhas == "primeira":
+                tabelas, forms = todas[:1], []
+            elif modo_folhas == "todas":
+                tabelas, forms = todas, []
+            else:  # auto: folhas-tabela como dados, folhas-formulário como metadados
+                forms = [t for t in todas if e_formulario(t[1])]
+                tabelas = [t for t in todas if t not in forms] or todas[:1]
+                if len(forms) == len(todas):
+                    forms = []
+            meta = {}
+            for folha, bruto, _ in forms:
+                pares = extrair_pares(bruto)
+                meta.update({k: v for k, v in pares.items() if k not in meta})
+            if meta:
+                resumos.append({"Ficheiro": f[0], **meta})
+            meta_id = {k: v for k, v in meta.items() if e_identificador(v)} if meta_colunas else {}
+
+            for folha, bruto, info in tabelas:
                 tab, linha_hdr = construir_tabela(bruto, hdr_manual)
                 tab = converter_tipos(tab)
                 cdata = detetar_coluna_data(tab)
                 if cdata:
                     tab[cdata] = parse_datas(tab[cdata])
                     tab = tab.rename(columns={cdata: "__DATA__"}).assign(__NOMEDATA__=cdata)
+                for k, v in meta_id.items():
+                    if k not in tab.columns:
+                        tab[k] = v
                 if incluir_origem:
                     tab["Ficheiro_origem"] = f[0]
-                    if folha:
+                    if folha and modo_folhas != "auto":
                         tab["Folha_origem"] = folha
                 tab["__ORD__"] = range(len(tab))
                 tab["__FICH__"] = i
                 partes.append(tab)
                 dmin = tab["__DATA__"].min() if cdata else None
                 dmax = tab["__DATA__"].max() if cdata else None
+                extra = f"metadados de: {', '.join(x[0] for x in forms)}" if forms else ""
                 log.append({"Ficheiro": f[0], "Folha": folha, "Linhas": len(tab),
                             "Linha cabeçalho": linha_hdr, "Coluna de data": cdata or "(não detetada)",
-                            "Data mín": dmin, "Data máx": dmax, "Info": info, "Erro": ""})
+                            "Data mín": dmin, "Data máx": dmax,
+                            "Info": "; ".join(x for x in (info, extra) if x), "Erro": ""})
         except Exception as e:
             log.append({"Ficheiro": f[0], "Folha": "", "Linhas": 0, "Linha cabeçalho": None,
                         "Coluna de data": "", "Data mín": None, "Data máx": None, "Info": "",
@@ -332,7 +549,6 @@ def processar(ficheiros, todas_folhas=False, remover_dup=True, juntar_maiusc=Tru
     if not partes:
         return None, None, log, 0, False
 
-    # nome da coluna de data final: o mais frequente
     nomes_data = [p["__NOMEDATA__"].iloc[0] for p in partes if "__NOMEDATA__" in p and len(p)]
     nome_data = max(set(nomes_data), key=nomes_data.count) if nomes_data else None
 
@@ -351,7 +567,8 @@ def processar(ficheiros, todas_folhas=False, remover_dup=True, juntar_maiusc=Tru
                 todas_cols.append(c)
     mapa = pd.DataFrame([{**{"Ficheiro": l["Ficheiro"], "Folha": l["Folha"]},
                           **{c: ("✓" if c in p.columns else "") for c in todas_cols}}
-                         for l, p in zip([l for l in log if not l["Erro"]], partes)])
+                         for l, p in zip([l for l in log if not l["Erro"]
+                                          and not str(l.get("Info", "")).startswith("ignorado")], partes)])
 
     df = pd.concat(partes, ignore_index=True, sort=False)
     df = df.drop(columns=["__NOMEDATA__"], errors="ignore")
@@ -376,6 +593,8 @@ def processar(ficheiros, todas_folhas=False, remover_dup=True, juntar_maiusc=Tru
             folhas.update(resumos_omie(df))
         except Exception as e:
             log.append({"Ficheiro": "(resumos OMIE)", "Erro": str(e)})
+    if resumos:
+        folhas["Resumo_por_ficheiro"] = pd.DataFrame(resumos)
     folhas["Ficheiros"] = pd.DataFrame(log)
     folhas["Colunas_por_ficheiro"] = mapa
 
@@ -544,10 +763,17 @@ st.markdown("""
 
 with st.sidebar:
     st.markdown("## Opções")
-    todas_folhas = st.toggle("Ler todas as folhas dos Excel", value=False,
-                             help="Desligado: lê só a primeira folha de cada ficheiro.")
-    remover_dup = st.toggle("Remover linhas duplicadas", value=True,
-                            help="Linhas iguais em todas as colunas de dados (ignora a origem).")
+    modo_lbl = st.radio("Folhas dos Excel", ["Automático", "Só a primeira", "Todas"], index=0,
+                        help="Automático: junta as folhas com tabelas de dados e usa folhas do tipo "
+                             "'Resumo' (etiqueta: valor) como informação do ficheiro.")
+    modo_folhas = {"Automático": "auto", "Só a primeira": "primeira", "Todas": "todas"}[modo_lbl]
+    meta_colunas = st.toggle("Repetir dados do resumo em cada linha (CPE, cliente…)", value=True)
+    remover_fich_rep = st.toggle("Ignorar ficheiros repetidos", value=True,
+                                 help="Ficheiros com conteúdo exatamente igual são lidos só uma vez.")
+    remover_dup = st.toggle("Remover linhas duplicadas", value=False,
+                            help="Útil quando os ficheiros se sobrepõem no tempo (ex.: preços OMIE). "
+                                 "Desligado por defeito para não apagar linhas iguais de "
+                                 "instalações diferentes.")
     juntar_maiusc = st.toggle("Juntar colunas ignorando maiúsculas", value=True)
     incluir_origem = st.toggle("Colunas de origem (ficheiro/folha)", value=True)
     hdr_auto = st.toggle("Detetar cabeçalho automaticamente", value=True)
@@ -589,8 +815,9 @@ with st.container(border=True, key="glass_fich"):
 if correr and ficheiros:
     barra = st.progress(0.0, text="A processar…")
     df, folhas, log, n_bruto, tem_data = processar(
-        [(f.name, f.getvalue()) for f in ficheiros], todas_folhas, remover_dup, juntar_maiusc,
-        incluir_origem, hdr_manual, prog=lambda v: barra.progress(v, text="A processar…"))
+        [(f.name, f.getvalue()) for f in ficheiros], modo_folhas, remover_dup, juntar_maiusc,
+        incluir_origem, hdr_manual, prog=lambda v: barra.progress(v, text="A processar…"),
+        remover_fich_rep=remover_fich_rep, meta_colunas=meta_colunas)
     barra.empty()
     if df is None:
         st.error("Nenhum ficheiro válido.")
